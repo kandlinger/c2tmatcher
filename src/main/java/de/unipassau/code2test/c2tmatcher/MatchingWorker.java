@@ -4,12 +4,9 @@ import com.github.javaparser.StaticJavaParser;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.expr.MethodCallExpr;
-import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
 import com.github.javaparser.utils.Pair;
 import com.google.common.base.CaseFormat;
 import com.google.common.base.Converter;
-import javassist.expr.MethodCall;
-
 import java.io.IOException;
 import java.nio.file.*;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -17,30 +14,24 @@ import java.util.*;
 import java.util.concurrent.Callable;
 
 
-public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable {
-    private Path projectDirectory;
-    private boolean printMethodCalls;
-
+public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable<Void> {
     Map<String, Path> testClasses;
     Map<String, Path> classes;
-
     Map<Path, Path> testClassMapping;
-
     Map<Path, List<MethodDeclaration>> testClassMethods;
     Map<Path, List<MethodDeclaration>> classMethods;
-
     Map<Pair<Path, MethodDeclaration>, List<MethodCallExpr>> testClassMethodCalls;
+    Map<Pair<Path, MethodDeclaration>, List<Pair<Path, MethodDeclaration>>> classMethodToTestMethodsMapping;
+    Map<Pair<Path, MethodDeclaration>, List<Pair<Path, MethodDeclaration>>> testMethodsToClassMethodsMapping;
 
-    Map<MethodDeclaration, List<MethodDeclaration>> classMethodToTestMethodsMapping;
-    Map<MethodDeclaration, List<MethodDeclaration>> testMethodsToClassMethodsMapping;
+    NodeIterator nodeIterator;
+    private Path projectDirectory;
+    private MappingFile mappingFile;
 
-    Converter<String, String> methodConverter;
-    Converter<String, String> classConverter;
-
-    MatchingWorker(Path projectDirectory, boolean printMethodCalls) {
+    MatchingWorker(Path projectDirectory, MappingFile mappingFile) {
         Matcher.incrementProjectCounter();
         this.projectDirectory = projectDirectory;
-        this.printMethodCalls = printMethodCalls;
+        this.mappingFile = mappingFile;
 
         this.testClasses = new HashMap<>();
         this.classes = new HashMap<>();
@@ -55,19 +46,33 @@ public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable
         this.classMethodToTestMethodsMapping = new HashMap<>();
         this.testMethodsToClassMethodsMapping = new HashMap<>();
 
-        this.classConverter = CaseFormat.UPPER_CAMEL.converterTo(CaseFormat.LOWER_UNDERSCORE);
-        this.methodConverter = CaseFormat.LOWER_CAMEL.converterTo(CaseFormat.LOWER_UNDERSCORE);
+        this.nodeIterator = new NodeIterator();
 
     }
 
-    @Override
-    public Object call() throws Exception {
-        try {
-        Files.walkFileTree(projectDirectory, this);
-        matchTestClassesToClasses();
-        extractTestClassMethods();
-        extractClassMethods();
+    public static String removeJavaEnding(String filename) {
+        return filename.substring(0, filename.length()-5);
+    }
 
+    @Override
+    public Void call() throws Exception {
+        try {
+            Files.walkFileTree(projectDirectory, this);
+            matchTestClassesToClasses();
+            extractTestClassMethods();
+            extractClassMethods();
+            generateMappings();
+            mappingFile.printMapping(classMethodToTestMethodsMapping);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            Matcher.decrementProjectCounter();
+        }
+        return null;
+    }
+
+    private void generateMappings() {
         for(Path testClass : testClassMethods.keySet()) {
             Path classUnderTest = testClassMapping.get(testClass);
             List<MethodDeclaration> classUnderTestMethods = classMethods.get(classUnderTest);
@@ -77,15 +82,24 @@ public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable
                     for (MethodCallExpr methodCallExpr : currentTestClassMethodCalls) {
                         for (MethodDeclaration classUnderTestMethod : classUnderTestMethods) {
                             if (methodCallExpr.getNameAsString().matches(classUnderTestMethod.getNameAsString()) && methodCallExpr.getArguments().size() == classUnderTestMethod.getParameters().size()) {
-                                if (printMethodCalls) {
-                                    System.out.println(projectDirectory.getFileName() +
-                                            "," + classConverter.convert(removeJavaEnding(testClass.getFileName().toString())) +
-                                            "," + methodConverter.convert(testMethod.getNameAsString()) +
-                                            "," + classConverter.convert(removeJavaEnding(classUnderTest.getFileName().toString())) +
-                                            "," + methodConverter.convert(classUnderTestMethod.getNameAsString() + "(" + classUnderTestMethod.getParameters().size() + ")"));
-                                } else {
-                                    //TODO
-                                }
+                                    Pair<Path, MethodDeclaration> cmttmKey = new Pair<>(classUnderTest, classUnderTestMethod);
+                                    Pair<Path, MethodDeclaration> tmtcmKey = new Pair<>(testClass, testMethod);
+
+                                    if(classMethodToTestMethodsMapping.containsKey(cmttmKey)) {
+                                        classMethodToTestMethodsMapping.get(cmttmKey).add(new Pair<>(testClass, testMethod));
+                                    } else {
+                                        List<Pair<Path, MethodDeclaration>> cmttmList = new ArrayList<>();
+                                        cmttmList.add((new Pair<>(testClass, testMethod)));
+                                        classMethodToTestMethodsMapping.put(cmttmKey, cmttmList);
+                                    }
+
+                                    if(testMethodsToClassMethodsMapping.containsKey(tmtcmKey)) {
+                                        testMethodsToClassMethodsMapping.get(tmtcmKey).add(new Pair<>(testClass, testMethod));
+                                    } else {
+                                        List<Pair<Path, MethodDeclaration>> tmtcmList = new ArrayList<>();
+                                        tmtcmList.add((new Pair<>(testClass, testMethod)));
+                                        testMethodsToClassMethodsMapping.put(tmtcmKey, tmtcmList);
+                                    }
                                 break;
                             }
                         }
@@ -94,72 +108,28 @@ public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable
 
             }
         }
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            Matcher.decrementProjectCounter();
-        }
-        return null;
     }
 
     private void extractTestClassMethods() throws IOException {
         for (Path testClass : testClassMapping.keySet()) {
-            List<MethodDeclaration> methodDeclarations = new ArrayList<>();
-
             CompilationUnit compilationUnitTestClass = StaticJavaParser.parse(testClass);
-            VoidVisitorAdapter<Void> compilationUnitTestClassVisitor = new VoidVisitorAdapter<Void>() {
-                private MethodDeclaration lastMethodDeclaration;
-
-                @Override
-                public void visit(MethodDeclaration n, Void arg) {
-                    if(n.getAnnotationByName("Test") != null) {
-                        methodDeclarations.add(n);
-                        lastMethodDeclaration = n;
-                        super.visit(n, arg);
-                    } else {
-                        lastMethodDeclaration = null;
-                    }
-                }
-
-                @Override
-                public void visit(MethodCallExpr n, Void arg) {
-                    if(lastMethodDeclaration != null) {
-                        if (testClassMethodCalls.containsKey(new Pair<>(testClass, lastMethodDeclaration))) {
-                            testClassMethodCalls.get(new Pair<>(testClass, lastMethodDeclaration)).add(n);
-                        } else {
-                            List<MethodCallExpr> newList = new ArrayList<>();
-                            newList.add(n);
-                            testClassMethodCalls.put(new Pair<>(testClass, lastMethodDeclaration), newList);
-                        }
-                        super.visit(n, arg);
-                    }
-                }
-            };
-            compilationUnitTestClassVisitor.visit(compilationUnitTestClass, null);
-            testClassMethods.put(testClass, methodDeclarations);
+            TestClassVisitor testClassVisitor = new TestClassVisitor(testClass);
+            testClassVisitor.visit(compilationUnitTestClass, null);
+            this.testClassMethodCalls.putAll(testClassVisitor.getTestClassMethodCalls());
+            testClassMethods.put(testClass, testClassVisitor.getMethodDeclarations());
         }
     }
 
     private void extractClassMethods() throws IOException {
         for (Path classUnderTest : testClassMapping.values()) {
             if(!classMethods.containsKey(classUnderTest)) {
-                List<MethodDeclaration> methodDeclarations = new ArrayList<>();
-
                 CompilationUnit compilationUnitTestClass = StaticJavaParser.parse(classUnderTest);
-                VoidVisitorAdapter<Void> compilationUnitClassVisitor = new VoidVisitorAdapter<Void>() {
-                    @Override
-                    public void visit(MethodDeclaration n, Void arg) {
-                        methodDeclarations.add(n);
-                        super.visit(n, arg);
-                    }
-                };
-                compilationUnitClassVisitor.visit(compilationUnitTestClass, null);
-
-                classMethods.put(classUnderTest, methodDeclarations);
+                ClassVisitor classVisitor = new ClassVisitor();
+                classVisitor.visit(compilationUnitTestClass, null);
+                classMethods.put(classUnderTest, classVisitor.getMethodDeclarations());
             }
         }
     }
-
 
     private void matchTestClassesToClasses() {
         for(String testClassName : testClasses.keySet()) {
@@ -178,9 +148,5 @@ public class MatchingWorker extends SimpleFileVisitor<Path>  implements Callable
             classes.put(file.getFileName().toString(), file);
         }
         return super.visitFile(file, attrs);
-    }
-
-    private static String removeJavaEnding(String filename) {
-        return filename.substring(0, filename.length()-5);
     }
 }

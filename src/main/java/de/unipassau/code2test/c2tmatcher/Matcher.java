@@ -5,7 +5,6 @@ import java.nio.file.Path;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
 import picocli.CommandLine;
 
 @CommandLine.Command(name = "c2tmatcher", mixinStandardHelpOptions = true, version = "c2tmatcher 1.0",
@@ -16,10 +15,12 @@ public class Matcher implements Callable<Integer> {
     private CommandLine.Model.CommandSpec spec;
     private Path rootDirectory;
     private int numberOfThreads;
-    private boolean printMethodCalls;
+
+    private Path mappingOutputFile;
     private boolean printProgress;
 
     private static int projectCounter = 0;
+    private MappingFile mappingFile;
 
     private ExecutorService executorService;
 
@@ -40,16 +41,18 @@ public class Matcher implements Callable<Integer> {
         this.numberOfThreads = numberOfThreads;
     }
 
+    @CommandLine.Option(names={"-m", "--mappingFile"}, defaultValue = "",
+            description = "Output file for mapping of methods to test methods.")
+    public void setMappingOutputFile(Path mappingOutputFile) {
+        if(Files.exists(mappingOutputFile)) throw new CommandLine.ParameterException(spec.commandLine(),
+                String.format("Invalid value '%s' for option 'mappingFile': file does already exist.", rootDirectory));
+        this.mappingOutputFile = mappingOutputFile;
+    }
+
     @CommandLine.Option(names={"-p", "--progress"},
             description = "Print progress to stderr.")
     public void setPrintProgress(boolean printProgress) {
         this.printProgress = printProgress;
-    }
-
-    @CommandLine.Option(names={"-m", "--methodCalls"},
-            description = "Print matching method calls of test methods.")
-    public void setPrintMethodCalls(boolean printMethodCalls) {
-        this.printMethodCalls = printMethodCalls;
     }
 
     public static void main(String[] args) {
@@ -59,25 +62,26 @@ public class Matcher implements Callable<Integer> {
 
     @Override
     public Integer call() throws Exception {
-        int totalProjects = 0;
-        executorService = Executors.newFixedThreadPool(numberOfThreads);
+            int totalProjects = 0;
+            mappingFile = new MappingFile(mappingOutputFile);
+            executorService = Executors.newFixedThreadPool(numberOfThreads);
 
-        for (Path projectDirectory : Files.newDirectoryStream(rootDirectory)) {
-            if (Files.isDirectory(projectDirectory)) {
-                totalProjects++;
-                executorService.submit(new MatchingWorker(projectDirectory, printMethodCalls));
+            for (Path projectDirectory : Files.newDirectoryStream(rootDirectory)) {
+                if (Files.isDirectory(projectDirectory)) {
+                    totalProjects++;
+                    executorService.submit(new MatchingWorker(projectDirectory, mappingFile));
+                }
             }
-        }
 
-        while(Matcher.projectCounter > 0) {
-            if(printProgress) {
-                System.err.println("Processing project " + (totalProjects - Matcher.projectCounter) + " of " + totalProjects);
+            while (Matcher.projectCounter > 0) {
+                if (printProgress) {
+                    System.err.println("Processing project " + (totalProjects - Matcher.projectCounter) + " of " + totalProjects);
+                }
+                Thread.sleep(1000);
             }
-            Thread.sleep(1000);
-        }
-        System.err.println("Processing project " + (totalProjects - Matcher.projectCounter) + " of " + totalProjects);
-
-        return 0;
+            System.err.println("Processing project " + (totalProjects - Matcher.projectCounter) + " of " + totalProjects);
+            mappingFile.close();
+            return 0;
     }
 
     public static synchronized void incrementProjectCounter() {
